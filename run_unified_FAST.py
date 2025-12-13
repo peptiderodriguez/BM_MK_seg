@@ -551,8 +551,9 @@ class UnifiedSegmenter:
             emb_y = int(cy / 16)
             emb_x = int(cx / 16)
             shape = self.sam2_predictor._features.shape
-            emb_y = min(max(0, emb_y), shape[2] - 1)
-            emb_x = min(max(0, emb_x), shape[3] - 1)
+            # Ensure indices are integers after clipping
+            emb_y = int(min(max(0, emb_y), shape[2] - 1))
+            emb_x = int(min(max(0, emb_x), shape[3] - 1))
             return self.sam2_predictor._features[0, :, emb_y, emb_x].cpu().numpy()
         except:
             return np.zeros(256)
@@ -667,7 +668,13 @@ class UnifiedSegmenter:
         self.sam2_predictor.set_image(image_rgb)
 
         # Cellpose with grayscale mode, let cpsam auto-detect size
-        cellpose_masks, _, _ = self.cellpose.eval(image_rgb, channels=[0,0])
+        # Note: Cellpose v4+ uses channel_axis instead of deprecated channels parameter
+        try:
+            # Try Cellpose v4+ API
+            cellpose_masks, _, _ = self.cellpose.eval(image_rgb, channel_axis=None)
+        except TypeError:
+            # Fallback to older Cellpose API (v3.x)
+            cellpose_masks, _, _ = self.cellpose.eval(image_rgb, channels=[0,0])
 
         # Get Cellpose centroids
         cellpose_ids = np.unique(cellpose_masks)
