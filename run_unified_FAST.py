@@ -426,7 +426,7 @@ class UnifiedSegmenter:
 
     def __init__(
         self,
-        sam2_checkpoint="checkpoints/sam2.1_hiera_large.pt",
+        sam2_checkpoint="sam2.1_hiera_large.pt",
         sam2_config="configs/sam2.1/sam2.1_hiera_l.yaml",
         mk_classifier_path=None,
         hspc_classifier_path=None,
