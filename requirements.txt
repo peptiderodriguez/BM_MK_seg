@@ -1,3 +1,13 @@
+# IMPORTANT: Install PyTorch FIRST with CUDA support before other dependencies!
+#
+# For NVIDIA GPUs (RTX 3090, etc.):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+# For AMD GPUs (MI250X on HPC clusters):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.0
+#
+# Then install the rest of the dependencies below.
+
 # Core dependencies
 numpy
 opencv-python
@@ -6,10 +16,6 @@ scikit-image
 h5py
 tqdm
 pillow
-
-# Deep learning
-torch>=2.0.0
-torchvision
 
 # Segmentation models
 git+https://github.com/facebookresearch/segment-anything-2.git
