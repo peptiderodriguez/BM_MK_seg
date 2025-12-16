@@ -15,12 +15,7 @@ Usage:
 
 # Set cellpose model path FIRST, before any imports (cellpose caches this at import time)
 import os
-from pathlib import Path
-
-# Use checkpoints directory relative to this script
-SCRIPT_DIR = Path(__file__).parent
-CHECKPOINTS_DIR = SCRIPT_DIR / "checkpoints"
-os.environ['CELLPOSE_LOCAL_MODELS_PATH'] = str(CHECKPOINTS_DIR)
+os.environ['CELLPOSE_LOCAL_MODELS_PATH'] = '/ptmp/edrod/MKsegmentation/checkpoints'
 
 import numpy as np
 import h5py
@@ -426,7 +421,7 @@ class UnifiedSegmenter:
 
     def __init__(
         self,
-        sam2_checkpoint="sam2.1_hiera_large.pt",
+        sam2_checkpoint="checkpoints/sam2.1_hiera_large.pt",
         sam2_config="configs/sam2.1/sam2.1_hiera_l.yaml",
         mk_classifier_path=None,
         hspc_classifier_path=None,
@@ -446,8 +441,9 @@ class UnifiedSegmenter:
         else:
             self.device = device
 
-        # Find SAM2 checkpoint (relative to script location)
-        checkpoint_path = CHECKPOINTS_DIR / sam2_checkpoint
+        # Find SAM2 checkpoint
+        sam2_base = Path("/ptmp/edrod/MKsegmentation")
+        checkpoint_path = sam2_base / sam2_checkpoint
 
         print(f"Loading SAM2 from {checkpoint_path}...")
         sam2_model = build_sam2(sam2_config, str(checkpoint_path), device=self.device)
@@ -551,9 +547,8 @@ class UnifiedSegmenter:
             emb_y = int(cy / 16)
             emb_x = int(cx / 16)
             shape = self.sam2_predictor._features.shape
-            # Ensure indices are integers after clipping
-            emb_y = int(min(max(0, emb_y), shape[2] - 1))
-            emb_x = int(min(max(0, emb_x), shape[3] - 1))
+            emb_y = min(max(0, emb_y), shape[2] - 1)
+            emb_x = min(max(0, emb_x), shape[3] - 1)
             return self.sam2_predictor._features[0, :, emb_y, emb_x].cpu().numpy()
         except:
             return np.zeros(256)
@@ -668,13 +663,7 @@ class UnifiedSegmenter:
         self.sam2_predictor.set_image(image_rgb)
 
         # Cellpose with grayscale mode, let cpsam auto-detect size
-        # Note: Cellpose v4+ uses channel_axis instead of deprecated channels parameter
-        try:
-            # Try Cellpose v4+ API
-            cellpose_masks, _, _ = self.cellpose.eval(image_rgb, channel_axis=None)
-        except TypeError:
-            # Fallback to older Cellpose API (v3.x)
-            cellpose_masks, _, _ = self.cellpose.eval(image_rgb, channels=[0,0])
+        cellpose_masks, _, _ = self.cellpose.eval(image_rgb, channels=[0,0])
 
         # Get Cellpose centroids
         cellpose_ids = np.unique(cellpose_masks)
