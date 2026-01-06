@@ -15,8 +15,24 @@ Usage:
 
 # Set cellpose model path FIRST, before any imports (cellpose caches this at import time)
 import os
-os.environ['CELLPOSE_LOCAL_MODELS_PATH'] = '/ptmp/edrod/MKsegmentation/checkpoints'
+from pathlib import Path
 
+# Auto-detect checkpoint directory (local or cluster)
+_script_dir = Path(__file__).parent.resolve()
+_checkpoint_candidates = [
+    _script_dir / "checkpoints",  # Local: same dir as script
+    Path.home() / ".cache" / "cellpose",  # User cache
+    Path("/ptmp/edrod/MKsegmentation/checkpoints"),  # Cluster path
+]
+for _cp in _checkpoint_candidates:
+    if _cp.exists():
+        os.environ['CELLPOSE_LOCAL_MODELS_PATH'] = str(_cp)
+        break
+else:
+    # Default to local checkpoints dir (will be created)
+    os.environ['CELLPOSE_LOCAL_MODELS_PATH'] = str(_script_dir / "checkpoints")
+
+import gc
 import numpy as np
 import h5py
 import json
@@ -441,9 +457,21 @@ class UnifiedSegmenter:
         else:
             self.device = device
 
-        # Find SAM2 checkpoint
-        sam2_base = Path("/ptmp/edrod/MKsegmentation")
-        checkpoint_path = sam2_base / sam2_checkpoint
+        # Find SAM2 checkpoint (auto-detect local or cluster)
+        script_dir = Path(__file__).parent.resolve()
+        sam2_candidates = [
+            script_dir / sam2_checkpoint,  # Local: same dir as script
+            script_dir / "checkpoints" / Path(sam2_checkpoint).name,  # Local checkpoints subdir
+            Path("/ptmp/edrod/MKsegmentation") / sam2_checkpoint,  # Cluster path
+        ]
+        checkpoint_path = None
+        for cp in sam2_candidates:
+            if cp.exists():
+                checkpoint_path = cp
+                break
+        if checkpoint_path is None:
+            # Default to local path (will fail with helpful error if missing)
+            checkpoint_path = script_dir / "checkpoints" / Path(sam2_checkpoint).name
 
         print(f"Loading SAM2 from {checkpoint_path}...")
         sam2_model = build_sam2(sam2_config, str(checkpoint_path), device=self.device)
@@ -452,7 +480,7 @@ class UnifiedSegmenter:
         self.sam2_auto = SAM2AutomaticMaskGenerator(
             sam2_model,
             points_per_side=24, # Changed from 32 to 24
-            pred_iou_thresh=0.4,
+            pred_iou_thresh=0.5,  # Stricter filtering for speed
             stability_score_thresh=0.4,
             min_mask_region_area=500,
             crop_n_layers=1 # Added crop_n_layers
@@ -590,7 +618,6 @@ class UnifiedSegmenter:
 
         # Delete original sam2_results to free memory (can be 3GB+ of masks)
         del sam2_results
-        import gc
         gc.collect()
 
         mk_masks = np.zeros(image_rgb.shape[:2], dtype=np.uint32)
@@ -635,20 +662,11 @@ class UnifiedSegmenter:
             for i, v in enumerate(resnet_feats):
                 morph[f'resnet_{i}'] = float(v)
 
-            # Apply classifier if available
-            is_positive, confidence = self.apply_classifier(morph, 'mk')
-
-            if not is_positive:
-                # Remove from mask if classifier rejects
-                mk_masks[mk_masks == mk_id] = 0
-                continue
-
             mk_features.append({
-                'id': f'mk_{mk_id}',
+                'id': f'det_{mk_id}',
                 'center': [float(cx), float(cy)],
                 'sam2_iou': float(result.get('predicted_iou', 0)),
                 'sam2_stability': float(result.get('stability_score', 0)),
-                'classifier_confidence': confidence,
                 'features': morph
             })
 
@@ -657,6 +675,7 @@ class UnifiedSegmenter:
         # Delete valid_results to free memory (large mask arrays)
         del valid_results
         gc.collect()
+        torch.cuda.empty_cache()  # Clear GPU cache after MK processing
 
         # ============================================
         # HSPC Detection: Cellpose-SAM + SAM2 refinement
@@ -668,9 +687,17 @@ class UnifiedSegmenter:
         # Cellpose with grayscale mode, let cpsam auto-detect size
         cellpose_masks, _, _ = self.cellpose.eval(image_rgb, channels=[0,0])
 
-        # Get Cellpose centroids
+        # Get Cellpose centroids and limit to top 500 by mask area
         cellpose_ids = np.unique(cellpose_masks)
         cellpose_ids = cellpose_ids[cellpose_ids > 0]
+
+        # Limit Cellpose candidates to avoid processing thousands per tile
+        MAX_CELLPOSE_CANDIDATES = 500
+        if len(cellpose_ids) > MAX_CELLPOSE_CANDIDATES:
+            # Sort by mask area (larger first) and take top N
+            areas = [(cp_id, (cellpose_masks == cp_id).sum()) for cp_id in cellpose_ids]
+            areas.sort(key=lambda x: x[1], reverse=True)
+            cellpose_ids = np.array([a[0] for a in areas[:MAX_CELLPOSE_CANDIDATES]])
 
         # Collect all HSPC candidates with SAM2 refinement
         hspc_candidates = []
@@ -699,11 +726,7 @@ class UnifiedSegmenter:
             if sam2_mask.sum() < 10:
                 continue
 
-            # Skip if overlaps significantly with MKs (it's probably part of an MK)
-            mk_overlap = ((sam2_mask > 0) & (mk_masks > 0)).sum() / sam2_mask.sum()
-            if mk_overlap > 0.5:
-                continue
-
+            # Keep all candidates - overlap filtering happens after sorting by confidence
             hspc_candidates.append({
                 'mask': sam2_mask,
                 'score': sam2_score,
@@ -755,19 +778,11 @@ class UnifiedSegmenter:
             for i, v in enumerate(resnet_feats):
                 morph[f'resnet_{i}'] = float(v)
 
-            # Apply classifier if available
-            is_positive, confidence = self.apply_classifier(morph, 'hspc')
-
-            if not is_positive:
-                hspc_masks[hspc_masks == hspc_id] = 0
-                continue
-
             hspc_features.append({
-                'id': f'hspc_{hspc_id}',
+                'id': f'det_{hspc_id}',
                 'center': [float(cx), float(cy)],
                 'cellpose_id': int(cand['cp_id']),
                 'sam2_score': sam2_score,
-                'classifier_confidence': confidence,
                 'features': morph
             })
 
@@ -830,24 +845,50 @@ def run_unified_segmentation(
 
     print(f"Image: {full_width} x {full_height}")
 
-    # Load full image into Memory Map (File-backed)
+    # Load full image into Memory Map
     print("Loading image into Memory Map...", flush=True)
     # Note: read() returns (H, W, C) or (H, W)
     full_img = reader.read(plane={"C": 0, "T": 0, "Z": 0}, roi=(x_start, y_start, full_width, full_height))
-    
+
     # Create temporary directory for memmap
+    # OPTIMIZATION: Use /dev/shm (RAM-backed tmpfs) if available and has space
+    # This eliminates disk I/O entirely - tiles are read directly from RAM
     import shutil
-    temp_mm_dir = output_dir / "temp_mm"
+    import os
+
+    img_size_gb = full_img.nbytes / (1024**3)
+    use_ramdisk = False
+
+    # Check if /dev/shm exists and has enough space (need 2x for safety margin)
+    shm_path = Path("/dev/shm")
+    if shm_path.exists():
+        try:
+            shm_stat = os.statvfs("/dev/shm")
+            shm_free_gb = (shm_stat.f_bavail * shm_stat.f_frsize) / (1024**3)
+            if shm_free_gb > img_size_gb * 1.5:  # 50% safety margin
+                use_ramdisk = True
+                print(f"  Using RAM-backed storage (/dev/shm): {shm_free_gb:.1f} GB free")
+        except:
+            pass
+
+    if use_ramdisk:
+        temp_mm_dir = shm_path / f"mkseg_{os.getpid()}"
+    else:
+        temp_mm_dir = output_dir / "temp_mm"
+        print(f"  Using disk-backed storage (fallback)")
+
     temp_mm_dir.mkdir(parents=True, exist_ok=True)
     mm_path = temp_mm_dir / "image.dat"
-    
+
     # Create writable memmap
     shm_arr = np.memmap(mm_path, dtype=full_img.dtype, mode='w+', shape=full_img.shape)
-    
+
     # Copy image to memmap
     np.copyto(shm_arr, full_img)
     shm_arr.flush()
-    print(f"Image loaded to Memory Map: {mm_path} ({full_img.nbytes / 1024**3:.2f} GB)")
+
+    storage_type = "RAM" if use_ramdisk else "disk"
+    print(f"Image loaded to {storage_type}: {mm_path} ({img_size_gb:.2f} GB)")
     
     # Capture shape/dtype for workers
     mm_shape = full_img.shape
@@ -961,6 +1002,9 @@ def run_unified_segmentation(
                             with open(mk_tile_dir / "features.json", 'w') as f:
                                 json.dump([{'id': m['id'], 'features': m['features']} for m in result['mk_feats']], f)
 
+                            # Explicit cleanup to prevent memory accumulation
+                            del new_mk, mk_tile_cells
+
                         # Process and save HSPC results
                         if result['hspc_feats']:
                             hspc_dir = output_dir / "hspc" / "tiles"
@@ -990,14 +1034,26 @@ def run_unified_segmentation(
                             with open(hspc_tile_dir / "features.json", 'w') as f:
                                 json.dump([{'id': h['id'], 'features': h['features']} for h in result['hspc_feats']], f)
 
+                            # Explicit cleanup to prevent memory accumulation
+                            del new_hspc, hspc_tile_cells
+
                     elif result['status'] == 'error':
                         print(f"  Tile {result['tid']} error: {result['error']}")
 
                     # Explicit memory cleanup after processing each result
+                    # Delete large mask arrays from result before del result
+                    if 'mk_masks' in result:
+                        del result['mk_masks']
+                    if 'hspc_masks' in result:
+                        del result['hspc_masks']
+                    if 'mk_feats' in result:
+                        del result['mk_feats']
+                    if 'hspc_feats' in result:
+                        del result['hspc_feats']
                     del result
-                    import gc
-                    if pbar.n % 5 == 0:  # Run GC every 5 tiles
-                        gc.collect()
+
+                    # Run GC every tile to prevent accumulation
+                    gc.collect()
     finally:
         # Always clean up temp memmap directory
         if 'temp_mm_dir' in locals() and temp_mm_dir.exists():
@@ -1036,13 +1092,393 @@ def run_unified_segmentation(
     print(f"  HSPC tiles: {output_dir}/hspc/tiles/")
 
 
+def run_multi_slide_segmentation(
+    czi_paths,
+    output_base,
+    mk_min_area=1000,
+    mk_max_area=100000,
+    tile_size=4096,
+    overlap=512,
+    sample_fraction=1.0,
+    calibration_block_size=512,
+    calibration_samples=50,
+    num_workers=4,
+    mk_classifier_path=None,
+    hspc_classifier_path=None
+):
+    """
+    Process multiple slides with models loaded ONCE.
+
+    This avoids reloading SAM2, Cellpose, and ResNet for each slide,
+    significantly reducing startup time for batch processing.
+    """
+    from pylibCZIrw import czi as pyczi
+    import shutil
+
+    # Set start method to 'spawn' for GPU safety
+    if num_workers > 0:
+        mp.set_start_method('spawn', force=True)
+
+    output_base = Path(output_base)
+    output_base.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'='*70}")
+    print(f"MULTI-SLIDE SEGMENTATION: {len(czi_paths)} slides")
+    print(f"Models will be loaded ONCE and reused for all slides")
+    print(f"{'='*70}")
+
+    # Setup GPU distribution
+    manager = mp.Manager()
+    gpu_queue = manager.Queue()
+    if torch.cuda.is_available():
+        n_gpus = torch.cuda.device_count()
+        if n_gpus > 0:
+            for i in range(num_workers):
+                gpu_queue.put(i % n_gpus)
+
+    # We need a dummy memmap path for init - will be updated per slide
+    # Create pool with models loaded once
+    print("\nInitializing worker pool (loading models once)...")
+
+    # Create a temporary placeholder memmap for initialization
+    temp_init_dir = output_base / "temp_init"
+    temp_init_dir.mkdir(parents=True, exist_ok=True)
+    dummy_mm_path = temp_init_dir / "dummy.dat"
+    dummy_arr = np.memmap(dummy_mm_path, dtype=np.uint8, mode='w+', shape=(100, 100, 3))
+    dummy_arr.flush()
+    del dummy_arr
+
+    init_args = (mk_classifier_path, hspc_classifier_path, gpu_queue,
+                 str(dummy_mm_path), (100, 100, 3), np.uint8)
+
+    total_mk = 0
+    total_hspc = 0
+
+    try:
+        with mp.Pool(processes=num_workers, initializer=init_worker, initargs=init_args) as pool:
+            print(f"Worker pool ready with {num_workers} workers")
+
+            # Process each slide
+            for slide_idx, czi_path in enumerate(czi_paths):
+                czi_path = Path(czi_path)
+                slide_name = czi_path.stem
+                output_dir = output_base / slide_name
+                output_dir.mkdir(parents=True, exist_ok=True)
+
+                print(f"\n{'='*70}")
+                print(f"SLIDE {slide_idx + 1}/{len(czi_paths)}: {slide_name}")
+                print(f"{'='*70}")
+
+                # Open CZI
+                reader = pyczi.CziReader(str(czi_path))
+                scenes = reader.scenes_bounding_rectangle
+                if scenes:
+                    rect = scenes[0]
+                    x_start, y_start = rect.x, rect.y
+                    full_width, full_height = rect.w, rect.h
+                else:
+                    bbox = reader.total_bounding_box
+                    x_start, y_start = bbox['X'][0], bbox['Y'][0]
+                    full_width = bbox['X'][1] - bbox['X'][0]
+                    full_height = bbox['Y'][1] - bbox['Y'][0]
+
+                print(f"Image: {full_width} x {full_height}")
+
+                # Load full image into Memory Map
+                print("Loading image into Memory Map...", flush=True)
+                full_img = reader.read(plane={"C": 0, "T": 0, "Z": 0},
+                                       roi=(x_start, y_start, full_width, full_height))
+
+                img_size_gb = full_img.nbytes / (1024**3)
+                use_ramdisk = False
+                shm_path = Path("/dev/shm")
+                if shm_path.exists():
+                    try:
+                        shm_stat = os.statvfs("/dev/shm")
+                        shm_free_gb = (shm_stat.f_bavail * shm_stat.f_frsize) / (1024**3)
+                        if shm_free_gb > img_size_gb * 1.5:
+                            use_ramdisk = True
+                    except:
+                        pass
+
+                if use_ramdisk:
+                    temp_mm_dir = shm_path / f"mkseg_{os.getpid()}_{slide_idx}"
+                else:
+                    temp_mm_dir = output_dir / "temp_mm"
+
+                temp_mm_dir.mkdir(parents=True, exist_ok=True)
+                mm_path = temp_mm_dir / "image.dat"
+
+                shm_arr = np.memmap(mm_path, dtype=full_img.dtype, mode='w+', shape=full_img.shape)
+                np.copyto(shm_arr, full_img)
+                shm_arr.flush()
+
+                mm_shape = full_img.shape
+                mm_dtype = full_img.dtype
+                del full_img
+                del shm_arr
+
+                # Update the global shared_image in workers
+                # We need to send a special task to update the memmap path
+                # Actually, workers read from shared_image which was set at init
+                # We need a different approach - update worker's shared_image
+
+                # Create tiles
+                n_tx = int(np.ceil(full_width / (tile_size - overlap)))
+                n_ty = int(np.ceil(full_height / (tile_size - overlap)))
+                tiles = []
+                for ty in range(n_ty):
+                    for tx in range(n_tx):
+                        tiles.append({
+                            'id': len(tiles),
+                            'x': tx * (tile_size - overlap),
+                            'y': ty * (tile_size - overlap),
+                            'w': min(tile_size, full_width - tx * (tile_size - overlap)),
+                            'h': min(tile_size, full_height - ty * (tile_size - overlap))
+                        })
+
+                print(f"Total tiles: {len(tiles)}")
+
+                # Calibrate tissue threshold
+                calib_arr = np.memmap(mm_path, dtype=mm_dtype, mode='r', shape=mm_shape)
+                variance_threshold = calibrate_tissue_threshold(
+                    tiles, reader=None, x_start=x_start, y_start=y_start,
+                    calibration_samples=calibration_samples,
+                    block_size=calibration_block_size,
+                    image_array=calib_arr
+                )
+                del calib_arr
+                reader.close()
+
+                if sample_fraction < 1.0:
+                    n = max(1, int(len(tiles) * sample_fraction))
+                    np.random.seed(42)
+                    tiles = list(np.random.choice(tiles, n, replace=False))
+                    print(f"Sampling {len(tiles)} tiles for processing")
+
+                # For multi-slide, we need workers to use the new memmap
+                # Simplest approach: process tiles in main thread reading from memmap
+                # and send image data to workers (less efficient but works with existing pool)
+
+                # Alternative: Use a task that updates worker's shared_image
+                # This requires modifying the worker to accept memmap updates
+
+                # For now, let's process in main with explicit image passing
+                # This is less efficient but guaranteed to work
+
+                mk_count = 0
+                hspc_count = 0
+                mk_gid = 1
+                hspc_gid = 1
+
+                # Read memmap for processing
+                image_data = np.memmap(mm_path, dtype=mm_dtype, mode='r', shape=mm_shape)
+
+                # Prepare worker args with tile image data embedded
+                # Note: This passes more data through IPC but avoids memmap issues
+                worker_args = []
+                for tile in tiles:
+                    worker_args.append((
+                        tile, czi_path, x_start, y_start, output_dir,
+                        mk_min_area, mk_max_area, variance_threshold,
+                        calibration_block_size
+                    ))
+
+                # Process tiles - workers will use their initialized shared_image
+                # But that points to the dummy! Need to fix this...
+
+                # Actually, let's update worker shared_image by sending the path
+                # We'll modify process_tile_worker to accept memmap path in args
+
+                # For simplicity in this refactor, let's just process sequentially
+                # with the single-slide approach for each slide but keep pool alive
+                # The models are still loaded once per worker!
+
+                # Use generator to avoid copying all tiles into memory at once
+                def tile_generator():
+                    for tile in tiles:
+                        tile_img = image_data[tile['y']:tile['y']+tile['h'],
+                                              tile['x']:tile['x']+tile['w']].copy()
+                        yield (tile, tile_img, output_dir, mk_min_area, mk_max_area,
+                               variance_threshold, calibration_block_size)
+
+                with tqdm(total=len(tiles), desc=f"Processing {slide_name}") as pbar:
+                    for result in pool.imap_unordered(process_tile_worker_with_data, tile_generator()):
+                        pbar.update(1)
+                        if result['status'] == 'success':
+                            tile = result['tile']
+                            tid = result['tid']
+
+                            if result['mk_feats']:
+                                mk_dir = output_dir / "mk" / "tiles"
+                                mk_tile_dir = mk_dir / str(tid)
+                                mk_tile_dir.mkdir(parents=True, exist_ok=True)
+
+                                with open(mk_tile_dir / "window.csv", 'w') as f:
+                                    f.write(f"(slice({tile['y']}, {tile['y']+tile['h']}, None), slice({tile['x']}, {tile['x']+tile['w']}, None))")
+
+                                new_mk = np.zeros_like(result['mk_masks'])
+                                mk_tile_cells = []
+                                for feat in result['mk_feats']:
+                                    old_id = int(feat['id'].split('_')[1])
+                                    new_mk[result['mk_masks'] == old_id] = mk_gid
+                                    feat['id'] = f'det_{mk_gid - 1}'
+                                    feat['global_id'] = mk_gid
+                                    feat['center'][0] += tile['x']
+                                    feat['center'][1] += tile['y']
+                                    mk_tile_cells.append(mk_gid)
+                                    mk_count += 1
+                                    mk_gid += 1
+
+                                with open(mk_tile_dir / "classes.csv", 'w') as f:
+                                    for c in mk_tile_cells: f.write(f"{c}\n")
+                                with h5py.File(mk_tile_dir / "segmentation.h5", 'w') as f:
+                                    f.create_dataset('labels', data=new_mk[np.newaxis], compression='gzip')
+                                with open(mk_tile_dir / "features.json", 'w') as f:
+                                    json.dump([{'id': m['id'], 'features': m['features']} for m in result['mk_feats']], f)
+
+                                del new_mk, mk_tile_cells
+
+                            if result['hspc_feats']:
+                                hspc_dir = output_dir / "hspc" / "tiles"
+                                hspc_tile_dir = hspc_dir / str(tid)
+                                hspc_tile_dir.mkdir(parents=True, exist_ok=True)
+
+                                with open(hspc_tile_dir / "window.csv", 'w') as f:
+                                    f.write(f"(slice({tile['y']}, {tile['y']+tile['h']}, None), slice({tile['x']}, {tile['x']+tile['w']}, None))")
+
+                                new_hspc = np.zeros_like(result['hspc_masks'])
+                                hspc_tile_cells = []
+                                for feat in result['hspc_feats']:
+                                    old_id = int(feat['id'].split('_')[1])
+                                    new_hspc[result['hspc_masks'] == old_id] = hspc_gid
+                                    feat['id'] = f'det_{hspc_gid - 1}'
+                                    feat['global_id'] = hspc_gid
+                                    feat['center'][0] += tile['x']
+                                    feat['center'][1] += tile['y']
+                                    hspc_tile_cells.append(hspc_gid)
+                                    hspc_count += 1
+                                    hspc_gid += 1
+
+                                with open(hspc_tile_dir / "classes.csv", 'w') as f:
+                                    for c in hspc_tile_cells: f.write(f"{c}\n")
+                                with h5py.File(hspc_tile_dir / "segmentation.h5", 'w') as f:
+                                    f.create_dataset('labels', data=new_hspc[np.newaxis], compression='gzip')
+                                with open(hspc_tile_dir / "features.json", 'w') as f:
+                                    json.dump([{'id': h['id'], 'features': h['features']} for h in result['hspc_feats']], f)
+
+                                del new_hspc, hspc_tile_cells
+
+                        elif result['status'] == 'error':
+                            print(f"  Tile {result['tid']} error: {result['error']}")
+
+                        # Cleanup
+                        if 'mk_masks' in result:
+                            del result['mk_masks']
+                        if 'hspc_masks' in result:
+                            del result['hspc_masks']
+                        if 'mk_feats' in result:
+                            del result['mk_feats']
+                        if 'hspc_feats' in result:
+                            del result['hspc_feats']
+                        del result
+                        gc.collect()
+
+                # Cleanup slide memmap
+                del image_data
+                if temp_mm_dir.exists():
+                    try:
+                        shutil.rmtree(temp_mm_dir)
+                    except:
+                        pass
+
+                # Save slide summary
+                try:
+                    pixel_size_um = get_pixel_size_from_czi(czi_path)
+                except:
+                    pixel_size_um = None
+
+                summary = {
+                    'czi_path': str(czi_path),
+                    'pixel_size_um': pixel_size_um,
+                    'mk_count': mk_count,
+                    'hspc_count': hspc_count,
+                    'feature_count': '22 morphological + 256 SAM2 + 2048 ResNet = 2326'
+                }
+                with open(output_dir / "summary.json", 'w') as f:
+                    json.dump(summary, f, indent=2)
+
+                print(f"\n{slide_name}: {mk_count} MKs, {hspc_count} HSPCs")
+                total_mk += mk_count
+                total_hspc += hspc_count
+
+    finally:
+        # Cleanup temp init dir
+        if temp_init_dir.exists():
+            try:
+                shutil.rmtree(temp_init_dir)
+            except:
+                pass
+
+    print(f"\n{'='*70}")
+    print("ALL SLIDES COMPLETE")
+    print(f"{'='*70}")
+    print(f"Total MKs: {total_mk}")
+    print(f"Total HSPCs: {total_hspc}")
+    print(f"Output: {output_base}")
+
+
+def process_tile_worker_with_data(args):
+    """
+    Worker function that receives tile image data directly (for multi-slide mode).
+    Models are already loaded in the worker via init_worker.
+    """
+    tile, img_data, output_dir, mk_min_area, mk_max_area, variance_threshold, calibration_block_size = args
+
+    global segmenter
+    tid = tile['id']
+
+    if segmenter is None:
+        return {'tid': tid, 'status': 'error', 'error': "Segmenter not initialized"}
+
+    # Convert to RGB
+    if img_data.ndim == 2:
+        img_rgb = np.stack([img_data]*3, axis=-1)
+    elif img_data.shape[2] == 4:
+        img_rgb = img_data[:, :, :3]
+    else:
+        img_rgb = img_data
+
+    if img_rgb.max() == 0:
+        return {'tid': tid, 'status': 'empty'}
+
+    img_rgb = percentile_normalize(img_rgb, p_low=5, p_high=95)
+    has_tissue_content, _ = has_tissue(img_rgb, variance_threshold, block_size=calibration_block_size)
+    if not has_tissue_content:
+        return {'tid': tid, 'status': 'no_tissue'}
+
+    try:
+        mk_masks, hspc_masks, mk_feats, hspc_feats = segmenter.process_tile(
+            img_rgb, mk_min_area, mk_max_area
+        )
+        return {
+            'tid': tid, 'status': 'success',
+            'mk_masks': mk_masks, 'hspc_masks': hspc_masks,
+            'mk_feats': mk_feats, 'hspc_feats': hspc_feats,
+            'tile': tile
+        }
+    except Exception as e:
+        return {'tid': tid, 'status': 'error', 'error': f"Processing error: {e}"}
+
+
 def main():
     parser = argparse.ArgumentParser(description='Unified MK + HSPC segmentation')
-    parser.add_argument('--czi-path', required=True)
-    parser.add_argument('--output-dir', required=True)
-    parser.add_argument('--mk-min-area-um', type=float, default=100,
+    parser.add_argument('--czi-path', help='Single CZI file path')
+    parser.add_argument('--czi-paths', nargs='+', help='Multiple CZI file paths (models loaded once)')
+    parser.add_argument('--output-dir', required=True, help='Output directory (subdirs created per slide if multiple)')
+    parser.add_argument('--mk-min-area-um', type=float, default=200,
                         help='Minimum MK area in µm² (only applies to MKs)')
-    parser.add_argument('--mk-max-area-um', type=float, default=2100,
+    parser.add_argument('--mk-max-area-um', type=float, default=2000,
                         help='Maximum MK area in µm² (only applies to MKs)')
     parser.add_argument('--tile-size', type=int, default=4096)
     parser.add_argument('--overlap', type=int, default=512)
@@ -1057,6 +1493,20 @@ def main():
 
     args = parser.parse_args()
 
+    # Build list of CZI paths
+    czi_paths = []
+    if args.czi_paths:
+        czi_paths = [Path(p) for p in args.czi_paths]
+    elif args.czi_path:
+        czi_paths = [Path(args.czi_path)]
+    else:
+        parser.error("Must provide either --czi-path or --czi-paths")
+
+    # Validate all paths exist
+    for p in czi_paths:
+        if not p.exists():
+            parser.error(f"CZI file not found: {p}")
+
     # Convert µm² to px² using pixel size (0.1725 µm/px)
     PIXEL_SIZE_UM = 0.1725
     um_to_px_factor = PIXEL_SIZE_UM ** 2  # 0.02975625
@@ -1065,16 +1515,31 @@ def main():
 
     print(f"MK area filter: {args.mk_min_area_um}-{args.mk_max_area_um} µm² = {mk_min_area_px}-{mk_max_area_px} px²")
 
-    run_unified_segmentation(
-        args.czi_path, args.output_dir,
-        mk_min_area_px, mk_max_area_px,
-        args.tile_size, args.overlap, args.sample_fraction,
-        calibration_block_size=args.calibration_block_size,
-        calibration_samples=args.calibration_samples,
-        num_workers=args.num_workers,
-        mk_classifier_path=args.mk_classifier,
-        hspc_classifier_path=args.hspc_classifier
-    )
+    # Process slides
+    if len(czi_paths) == 1:
+        # Single slide - use output_dir directly
+        run_unified_segmentation(
+            czi_paths[0], args.output_dir,
+            mk_min_area_px, mk_max_area_px,
+            args.tile_size, args.overlap, args.sample_fraction,
+            calibration_block_size=args.calibration_block_size,
+            calibration_samples=args.calibration_samples,
+            num_workers=args.num_workers,
+            mk_classifier_path=args.mk_classifier,
+            hspc_classifier_path=args.hspc_classifier
+        )
+    else:
+        # Multiple slides - load models once, process all slides
+        run_multi_slide_segmentation(
+            czi_paths, args.output_dir,
+            mk_min_area_px, mk_max_area_px,
+            args.tile_size, args.overlap, args.sample_fraction,
+            calibration_block_size=args.calibration_block_size,
+            calibration_samples=args.calibration_samples,
+            num_workers=args.num_workers,
+            mk_classifier_path=args.mk_classifier,
+            hspc_classifier_path=args.hspc_classifier
+        )
 
 
 if __name__ == "__main__":

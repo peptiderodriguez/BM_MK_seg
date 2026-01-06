@@ -14,8 +14,8 @@ OUTPUT_BASE="$HOME/BM_MK_seg_output"  # Output directory
 TILE_SIZE=4096           # Use maximum resolution
 NUM_WORKERS=4            # 4-6 workers safe for RTX 3090 (24GB VRAM)
 SAMPLE_FRACTION=0.10     # 10% for annotation, 1.0 for full processing
-MK_MIN_AREA_UM=100       # Minimum MK area in µm²
-MK_MAX_AREA_UM=2100      # Maximum MK area in µm²
+MK_MIN_AREA_UM=200       # Minimum MK area in µm²
+MK_MAX_AREA_UM=2000      # Maximum MK area in µm²
 
 # Optional: Use trained classifiers (leave empty if not using)
 MK_CLASSIFIER=""         # Path to mk_classifier.pkl or empty

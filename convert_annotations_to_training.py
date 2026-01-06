@@ -227,8 +227,8 @@ def convert_annotations(annotations_path, base_dir, output_path, mk_min_area_um=
         'source': {
             'annotations': str(annotations_path),
             'base_dir': str(base_dir),
-            'mk_samples_total': len(mk_samples),
-            'hspc_samples_total': len(hspc_samples)
+            'mk_samples_total': len(mk_inventory),
+            'hspc_samples_total': len(hspc_inventory)
         }
     }
 
