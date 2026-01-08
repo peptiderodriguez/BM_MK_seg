@@ -1,144 +1,205 @@
 # MK+HSPC Segmentation & Annotation Pipeline - Session Notes
-**Last Updated:** 2025-12-10 15:41
-
-## 🧹 DIRECTORY CLEANUP (2025-12-10 15:41)
-
-**Cleaned up duplicate/messy directories:**
-- DELETED: `/viper/u2/edrod/MKsegmentation/` (253GB of clutter - 1397 empty output directories)
-- DELETED: `/viper/u2/edrod/MKsegmentation_clean/` (empty directory from incomplete cleanup attempt)
-- PRESERVED: Job logs copied to `/viper/ptmp2/edrod/MKsegmentation/unified_10pct_4896272.{log,err}`
-
-**Working Directory (ONLY):**
-- `/viper/ptmp2/edrod/MKsegmentation/` - All 94 scripts, complete and official
+**Last Updated:** 2026-01-08
 
 ---
 
-## ⚠️ CRITICAL: Job 4896272 FAILED - OUT OF MEMORY
+## SESSION: 2026-01-08 - Job Complete + Integrated HTML Export
 
-**Job 4896272** ran OUT OF MEMORY after 7m 47s (processed 20/64 tiles of FGC1, then crashed)
+### Results
+**16-slide batch segmentation completed successfully!**
 
-**Problem:** RAM OOM with 16 workers + 128GB RAM limit
-- Workers initialized successfully (device bug IS fixed ✓)
+| Metric | Count |
+|--------|-------|
+| Total MKs | 39,362 |
+| Total HSPCs | 23,296 |
+| Slides Processed | 16/16 |
+| Processing Time | ~20 hours |
+
+### Performance After Optimizations
+- **Calibration**: 1600 samples in 1:44 (parallelized with ThreadPoolExecutor)
+- **Tissue checking**: 19,089 tiles at 10-70 tiles/sec (38 threads, ~20 min total)
+- **GPU processing**: 1159 sampled tiles at ~60 sec/tile average
+
+### Changes Made
+
+#### 1. Parallel Tissue Checking (10-35x speedup)
+Previous: Sequential, ~2 tiles/sec
+Now: ThreadPoolExecutor with 38 threads (80% of CPU), 10-70 tiles/sec
+
+```python
+tissue_check_threads = max(1, int(os.cpu_count() * 0.8))
+with ThreadPoolExecutor(max_workers=tissue_check_threads) as executor:
+    futures = {executor.submit(check_tile_tissue, tile_args): tile_args for tile_args in all_tiles}
+    for future in tqdm(as_completed(futures), total=len(all_tiles), desc="Checking tissue"):
+        ...
+```
+
+#### 2. Parallel Calibration
+Previous: Sequential, 30+ min stuck with no output
+Now: ThreadPoolExecutor + tqdm progress bar, completes in ~2 min
+
+#### 3. Integrated HTML Export (NEW)
+**Problem:** Export script had to reload 320GB of CZI files after segmentation
+**Solution:** Integrated export into main pipeline while slides are still in RAM
+
+New functions in `run_unified_FAST.py`:
+- `load_samples_from_ram()` - Extracts cell crops from in-memory slide arrays
+- `export_html_from_ram()` - Generates HTML pages using RAM data
+- `create_export_index()` - Creates index.html
+- `generate_export_pages()` - Creates mk_page*.html and hspc_page*.html
+
+New arguments:
+- `--html-output-dir` - Directory for HTML export (default: output_dir/../docs)
+- `--samples-per-page` - Cells per HTML page (default: 300)
+
+Export now runs automatically before releasing slide data from RAM.
+
+#### 4. HDF5 Plugin Fix
+- Added `import hdf5plugin` to export_separate_mk_hspc.py
+- Required for reading LZ4-compressed h5 files
+
+### Files Modified
+- `run_unified_FAST.py` - Added integrated HTML export, parallel tissue checking/calibration
+- `export_separate_mk_hspc.py` - Added hdf5plugin import
+- `run_local.sh` - Batch processing configuration
+
+---
+
+## SESSION: 2026-01-07 - Local Machine Setup & Batch Processing
+
+### Environment
+- **Machine:** Local workstation (48 cores, 432GB RAM, RTX 4090 24GB VRAM)
+- **CZI Source:** `/mnt/x/01_Users/EdRo_axioscan/bonemarrow/2025_11_18/`
+- **Output:** `~/BM_MK_seg_output/`
+
+### Changes Made
+
+#### 1. MK Filter Size Updated
+- Changed from **100-2100 µm²** to **200-2000 µm²**
+- Updated in:
+  - `run_unified_FAST.py` (default arguments)
+  - `run_local.sh` (configuration)
+  - `export_separate_mk_hspc.py` (default arguments)
+
+#### 2. Memory Leak Fixes
+Previous runs crashed the machine. Found and fixed:
+- Added `import gc` at module level
+- Added `torch.cuda.empty_cache()` after MK processing
+- Added explicit cleanup: `del new_mk, new_hspc` after HDF5 writes
+- Changed GC from every 5 tiles to **every tile**
+- Use generators for tile data to avoid memory spikes
+
+#### 3. Batch Processing (Models Load ONCE)
+- Added `--czi-paths` argument for multiple CZI files
+- Rewrote `run_multi_slide_segmentation()` for unified sampling:
+  - Loads ALL 16 slides into RAM (~350GB)
+  - Identifies tissue tiles across ALL slides
+  - Samples 10% from **combined pool** (truly representative)
+  - Processes with models loaded ONCE
+
+#### 4. Performance Tuning
+- Changed `pred_iou_thresh` from 0.4 to **0.5** (faster processing)
+- Set `NUM_WORKERS=1` (GPU memory is the bottleneck, not CPU/RAM)
+
+#### 5. Pipelined Processing Architecture (NEW)
+Created parallel CPU pre/post processing to maximize resource utilization:
+
+```
+Architecture:
+  CPU ThreadPool (pre)  -->  Queue  -->  GPU Worker  -->  Queue  -->  CPU ThreadPool (save)
+       23 threads                         1 process                       15 threads
+
+Thread allocation (80% of CPU cores = 38 threads on 48-core machine):
+  - Pre-process: 60% = 23 threads (extracting tiles from RAM, normalizing)
+  - Post-process: 40% = 15 threads (saving HDF5, features JSON)
+```
+
+New functions in `run_unified_FAST.py`:
+- `preprocess_tile_cpu()` - CPU-only tile extraction and normalization
+- `save_tile_results()` - CPU-only HDF5 and features saving
+- `process_tile_gpu_only()` - GPU-only SAM2/Cellpose/ResNet inference
+- `run_pipelined_segmentation()` - Orchestrates the pipeline
+
+### Current Job Status
+**Batch processing 16 slides with 10% unified sampling**
+
+```
+Progress: 460/1159 tiles (40%)
+Elapsed: ~10 hours
+Remaining: ~14-15 hours
+```
+
+Resource usage during run:
+| Resource | Used | Available | Utilization |
+|----------|------|-----------|-------------|
+| CPU | ~3% | 48 cores | Low (expected - GPU bottleneck) |
+| RAM | 355GB | 432GB | 82% (all slides loaded) |
+| GPU VRAM | 4GB | 24GB | 17% |
+| GPU Compute | 2% | 100% | Low (IO/preprocessing bound) |
+
+### Files Modified
+- `run_unified_FAST.py` - Major updates for batch processing, memory fixes, pipelined architecture
+- `run_local.sh` - Local execution script with batch mode
+- `export_separate_mk_hspc.py` - MK filter size update
+
+---
+
+## HISTORICAL: Cluster Work (2025-12-10)
+
+### Directory Cleanup
+- DELETED: `/viper/u2/edrod/MKsegmentation/` (253GB clutter)
+- DELETED: `/viper/u2/edrod/MKsegmentation_clean/` (empty)
+- PRESERVED: `/viper/ptmp2/edrod/MKsegmentation/` (official scripts)
+
+### Job 4896272 FAILED - OUT OF MEMORY
+- 16 workers × ~7.5GB each = ~120GB (exceeded 128GB limit)
 - Processed 31% of first slide before OOM
-- MaxRSS: 67.6GB (but 21 OOM kill events detected)
-- Issue: 16 workers × ~7.5GB per worker (SAM2 + Cellpose + ResNet) = ~120GB
-- Plus CZI memmap and processing overhead → exceeds 128GB
+- Solution: Reduce workers or increase memory
 
-**Solutions:**
-1. **Reduce workers from 16 to 12** (safer: ~90GB for models + room for processing)
-2. **Increase memory to 192GB or 256GB** (keep 16 workers)
-3. **Reduce workers to 8** (conservative: ~60GB for models, lots of headroom)
-
-**Recommendation:** Try 12 workers with 128GB first (balanced speed/safety)
+### Bug Fixes (Cluster)
+1. **Cellpose Device Bug** - Passed string instead of `torch.device` object
+2. **Export Script Filter Mismatch** - Hardcoded old filter values
 
 ---
 
-## CRITICAL BUG FIXES COMPLETED
+## Workflow
 
-### 1. Export Script Filter Mismatch (FIXED)
+### Current (Local Machine)
+```bash
+# 1. Run batch segmentation (MODE="batch" in run_local.sh)
+./run_local.sh
 
-**Problem:** `export_separate_mk_hspc.py` had HARDCODED old filter (4000-75000 px²) that didn't match new segmentation filter (100-2100 µm² = 3360-70573 px²)
+# 2. Automatic HTML export after segmentation
+# 3. Automatic git push to GitHub Pages
+```
 
-**Impact:** HTML export would show different cells than segmentation created → annotation IDs wouldn't match when converting to training data
+### Classifier Training (After Annotation)
+```bash
+# 1. Convert annotations
+python convert_annotations_to_training.py \
+    --annotations annotations/all_labels.json \
+    --base-dir ~/BM_MK_seg_output \
+    --mk-min-area-um 200 --mk-max-area-um 2000 \
+    --output annotations/training_data.json
 
-**Fix Applied:**
-- Added `--mk-min-area-um` and `--mk-max-area-um` parameters to export script
-- Converts µm² to px² internally (same logic as segmentation)
-- Updated all export wrapper scripts:
-  - `run_unified_10pct.sh` - passes `--mk-min-area-um 100 --mk-max-area-um 2100`
-  - `export_10pct_to_html.sh` - passes same parameters
-  - `run_export.sh` (for 2% data) - passes `--mk-min-area-um 119 --mk-max-area-um 2232` (OLD filter)
+# 2. Train classifiers
+python train_separate_classifiers.py \
+    --training-data annotations/training_data.json \
+    --output-mk mk_classifier.pkl \
+    --output-hspc hspc_classifier.pkl
 
-**Status:** ✅ FIXED - All scripts now consistent with µm-based filtering
-
----
-
-## Classifier Workflow - COMPLETE & VALIDATED
-
-**After 10% annotation and training, before deploying to 100% dataset:**
-
-1. **Validate classifiers with quality thresholds:**
-   ```bash
-   python validate_classifier.py \
-       --mk-classifier mk_classifier.pkl \
-       --hspc-classifier hspc_classifier.pkl \
-       --min-accuracy 0.75 \
-       --min-recall 0.70 \
-       --min-precision 0.70
-   ```
-
-2. **If validation passes, run full segmentation with classifiers:**
-   ```bash
-   # Run on 100% of tiles with trained classifiers
-   python run_unified_FAST.py \
-       --czi-path /path/to/slide.czi \
-       --output-dir /ptmp/edrod/unified_100pct \
-       --mk-classifier mk_classifier.pkl \
-       --hspc-classifier hspc_classifier.pkl \
-       --mk-min-area-um 100 \
-       --mk-max-area-um 2100 \
-       --num-workers 16 \
-       --sample-fraction 1.0
-   ```
-
-**Validation Thresholds:**
-- Minimum CV accuracy: 75%
-- Minimum recall (positive class): 70% (don't miss true positives)
-- Minimum precision (positive class): 70% (avoid false positives)
-
-**Classifier Integration Status:** ✅ ALREADY IMPLEMENTED
-- MK classifier: Applied at `run_unified_FAST.py:632`, filters detections before adding to results
-- HSPC classifier: Applied at `run_unified_FAST.py:738`, filters detections before adding to results
-- If `self.apply_classifier(morph, cell_type)` returns `is_positive=False`, cell is removed from mask
-- Confidence scores saved in features: `classifier_confidence`
-- When no classifier provided (`--mk-classifier` / `--hspc-classifier` omitted), `apply_classifier()` returns `(True, 1.0)` = accept all cells
-
----
-
-## Scripts Status
-
-### ✅ All Scripts Reviewed & Fixed
-
-**Segmentation:**
-- `/viper/ptmp2/edrod/MKsegmentation/run_unified_FAST.py` ✓ Reviewed - classifier integration working
-- `/viper/ptmp2/edrod/MKsegmentation/run_unified_10pct.sh` ✓ Updated - passes µm filter to export
-
-**HTML Export:**
-- `/viper/ptmp2/edrod/MKsegmentation/export_separate_mk_hspc.py` ✓ FIXED - accepts µm-based parameters
-- `/viper/ptmp2/edrod/MKsegmentation/export_10pct_to_html.sh` ✓ Updated - passes 100-2100 µm² parameters
-- `/viper/ptmp2/edrod/MKsegmentation/run_export.sh` ✓ Updated - passes 119-2232 µm² for 2% data
-
-**Annotation Processing:**
-- `/viper/ptmp2/edrod/MKsegmentation/convert_annotations_to_training.py` ✓ Reviewed - µm-based filtering correct
-- `/viper/ptmp2/edrod/MKsegmentation/train_separate_classifiers.py` ✓ Reviewed - proper class separation, balanced weights
-
-**Classifier Validation (NEW):**
-- `/viper/ptmp2/edrod/MKsegmentation/validate_classifier.py` ✓ Created & reviewed - validates against thresholds
-
-**Documentation:**
-- `/viper/ptmp2/edrod/MKsegmentation/WORKFLOW.md` ✓ Created - complete pipeline documentation
-
----
-
-## µm-BASED FILTERING (Implemented - User Preference)
-
-- MK size filter: **100-2100 µm²** (converts to 3360-70573 px² internally)
-- Pixel size: 0.1725 µm/px
-- Conversion factor: 0.02975625 (= 0.1725²)
-- User feedback: "more intuitive for users indeed"
-- Parameters: `--mk-min-area-um 100 --mk-max-area-um 2100`
-- HTML cards display both: "119.0 µm² | 4000 px²"
-
-**Implementation:**
-- Segmentation script (`run_unified_FAST.py`): Accepts µm parameters, converts to px internally
-- Export script (`export_separate_mk_hspc.py`): Accepts µm parameters, converts to px internally
-- Convert script (`convert_annotations_to_training.py`): Accepts µm parameters, converts to px internally
-- **All three scripts now consistent** - no more filter mismatches!
+# 3. Run 100% segmentation with classifiers
+python run_unified_FAST.py \
+    --czi-paths /path/to/*.czi \
+    --output-dir ~/BM_MK_seg_output \
+    --mk-classifier mk_classifier.pkl \
+    --hspc-classifier hspc_classifier.pkl \
+    --sample-fraction 1.0
+```
 
 ---
 
 ## 16 Slides
-
 - FGC1-4 (Female GC)
 - FHU1-4 (Female HU)
 - MGC1-4 (Male GC)
@@ -146,180 +207,74 @@
 
 ---
 
-## Expected Output (10% sampling)
+## Key Parameters
 
-- ~4,500 MK cells (5x more than 2% sampling)
-- ~110,000 HSPC cells
-- Paginated HTML with 300 samples/page
-
----
-
-## Previous Work
-
-### 2% Sampling (Completed)
-- 838 MK cells, 21,922 HSPC cells
-- Annotated: 171 MK (60 pos, 111 neg), 160 HSPC (75 pos, 85 neg)
-- **Result:** Too few samples for good RF classifier (59-68% accuracy)
-
-### RF Classifier Training (Abandoned)
-- Trained separate MK/HSPC classifiers
-- **MK:** 68% accuracy, 37% recall (poor)
-- **HSPC:** 51% accuracy (random)
-- **Conclusion:** Need more training data → 10% sampling
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `--mk-min-area-um` | 200 | Minimum MK area in µm² |
+| `--mk-max-area-um` | 2000 | Maximum MK area in µm² |
+| `--sample-fraction` | 0.10 | 10% sampling for annotation |
+| `--num-workers` | 1 | Limited by GPU memory |
+| `--tile-size` | 3000 | 3000x3000 tiles |
+| `pred_iou_thresh` | 0.5 | SAM2 confidence threshold |
 
 ---
 
-## Bug Fixes History
+## Technical Details
 
-### Cellpose Device Bug (FIXED - Job 4895943)
-- Error: `AttributeError: 'str' object has no attribute 'type'`
-- Location: `run_unified_FAST.py:436-460`
-- Cause: `init_worker()` passed device string `"cuda:0"`, stored as string, but Cellpose expects `torch.device` object with `.type` attribute
-- Fix: Added type checking and conversion to `torch.device` object
-- Resolution: Job 4895943 canceled, job 4896272 submitted with fix
-- **Verification:** Job 4896272 workers initialized successfully (device bug IS fixed)
+### µm to Pixel Conversion
+- Pixel size: 0.1725 µm/px
+- Conversion: 0.02975625 µm²/px²
+- 200-2000 µm² = 6721-67212 px²
 
-### Export Script Filter Mismatch (FIXED - Current session)
-- Hardcoded old filter `(4000, 75000)` px² in `export_separate_mk_hspc.py`
-- New 10% filter: `100-2100 µm²` = `3360-70573 px²`
-- Fix: Added `--mk-min-area-um` and `--mk-max-area-um` parameters
-- Converts internally using same logic as segmentation script
-- Updated all wrapper scripts to pass correct parameters
+### Memory Layout
+- Each slide: ~20-23 GB in RAM
+- 16 slides total: ~350 GB
+- Worker models: ~8-12 GB GPU VRAM per worker
+
+### GitHub
+- Repo: `peptiderodriguez/BM_MK_seg`
+- Live site: `https://peptiderodriguez.github.io/BM_MK_seg/`
 
 ---
 
-## Monitoring Commands
+## Resource Optimization Summary
 
-```bash
-# Check job status
-squeue -u edrod
+| Resource | Current Use | Max Available | Optimization |
+|----------|-------------|---------------|--------------|
+| RAM | 355GB (82%) | 432GB | All 16 slides loaded - MAXIMIZED |
+| CPU | 3% | 48 cores | Pipelined mode uses 80% for pre/post processing |
+| GPU VRAM | 4GB (17%) avg | 24GB | Single tile can spike to 100% - NO batching possible |
+| GPU Compute | 2% | 100% | Waiting on I/O - pipelining helps |
 
-# Check past jobs
-sacct -j <JOB_ID> --format=JobID,JobName,State,ExitCode,Elapsed
+### Implemented Optimizations
+- Load all slides into RAM (avoids disk I/O during processing)
+- Memory-mapped files in /dev/shm (fastest possible storage)
+- Pipelined CPU pre/post processing (80% of cores)
+- GC every tile + explicit cleanup (prevents memory leaks)
+- Single GPU worker (avoids VRAM contention)
 
-# Watch progress (when running)
-tail -f /viper/ptmp2/edrod/MKsegmentation/unified_10pct_<JOB_ID>.log
+### Newly Implemented Optimizations
+1. **LZ4 Compression** - HDF5 files now use LZ4 (3-5x faster than gzip)
+   - Auto-fallback to gzip if `hdf5plugin` not installed
+   - Install: `pip install hdf5plugin`
+2. **Pinned Memory** - Pre-processing allocates pinned (page-locked) memory
+   - Enables DMA transfer to GPU (doesn't block CPU)
+   - Automatic when CUDA available
 
-# Check errors
-tail -f /viper/ptmp2/edrod/MKsegmentation/unified_10pct_<JOB_ID>.err
-```
+### NOT Viable
+- **GPU Batch Inference** - Single tile can spike to 100% VRAM during SAM2 mask generation, no room for batching
+- **True Double Buffering** - Can't preload to GPU while 100% VRAM in use
 
 ---
 
 ## Next Steps
 
-### 1. FIX OOM ISSUE (URGENT)
-- Modify `run_unified_10pct.sh` to reduce workers from 16 to 12
-- OR increase memory from 128GB to 192GB
-- Resubmit job
-
-### 2. After Job Completes
-1. ✅ Verify HTML export succeeded
-2. ✅ Check GitHub Pages is live
-3. ⏳ **User annotates 10% dataset** via GitHub Pages
-4. ⏳ Transfer annotations back to cluster
-5. ⏳ **Convert annotations to training format:**
-   ```bash
-   python convert_annotations_to_training.py \
-       --annotations annotations/all_labels_10pct.json \
-       --base-dir /ptmp/edrod/unified_10pct \
-       --mk-min-area-um 100 \
-       --mk-max-area-um 2100 \
-       --output annotations/training_data_10pct.json
-   ```
-6. ⏳ **Train new RF classifiers:**
-   ```bash
-   python train_separate_classifiers.py \
-       --training-data annotations/training_data_10pct.json \
-       --output-mk mk_classifier.pkl \
-       --output-hspc hspc_classifier.pkl \
-       --morph-only
-   ```
-7. ⏳ **Validate classifiers:**
-   ```bash
-   python validate_classifier.py \
-       --mk-classifier mk_classifier.pkl \
-       --hspc-classifier hspc_classifier.pkl \
-       --min-accuracy 0.75 \
-       --min-recall 0.70 \
-       --min-precision 0.70
-   ```
-8. ⏳ **If valid, run on 100% dataset:**
-   ```bash
-   # Create batch job for full dataset with classifiers
-   # Run on all 16 slides with --sample-fraction 1.0
-   ```
-
----
-
-## Key Parameters
-
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| `--mk-min-area-um` | 100 | Minimum MK area in µm² |
-| `--mk-max-area-um` | 2100 | Maximum MK area in µm² |
-| `--sample-fraction` | 0.10 (10%) or 1.0 (100%) | Fraction of tiles to process |
-| `--num-workers` | 12 (RECOMMENDED) or 16 (OOM risk) | Parallel workers |
-| `--mk-classifier` | path/to/classifier.pkl | Optional: MK classifier |
-| `--hspc-classifier` | path/to/classifier.pkl | Optional: HSPC classifier |
-| `--tile-size` | 4096 | Tile size for processing |
-| `--calibration-samples` | 100 | Samples for SAM2 calibration |
-
----
-
-## Resource Allocation
-
-**GPU Memory (Bottleneck for worker count):**
-- 2× A100 GPUs @ 40GB each = 80GB total GPU memory
-- Each worker uses ~4GB GPU (SAM2 + Cellpose + ResNet)
-- Max safe workers: 20 (10 per GPU @ ~4GB per worker)
-- Current: 16 workers = 8 per GPU = ~32GB/80GB GPU ✓ OPTIMAL for GPU
-
-**RAM (Bottleneck for job 4896272):**
-- Each worker uses ~7.5GB RAM (SAM2 + Cellpose + ResNet models)
-- 16 workers × 7.5GB = ~120GB + processing overhead → OOM with 128GB limit
-- 12 workers × 7.5GB = ~90GB + processing overhead → should fit in 128GB
-- 8 workers × 7.5GB = ~60GB + processing overhead → very safe with 128GB
-
-**Recommendation:**
-- **Option 1 (balanced):** 12 workers + 128GB RAM
-- **Option 2 (faster):** 16 workers + 192GB RAM
-- **Option 3 (safe):** 8 workers + 128GB RAM
-
----
-
-## File Locations
-
-### Scripts
-- `/viper/ptmp2/edrod/MKsegmentation/run_unified_FAST.py` - Main segmentation
-- `/viper/ptmp2/edrod/MKsegmentation/run_unified_10pct.sh` - 10% batch job
-- `/viper/ptmp2/edrod/MKsegmentation/export_separate_mk_hspc.py` - HTML export
-- `/viper/ptmp2/edrod/MKsegmentation/convert_annotations_to_training.py` - Annotation conversion
-- `/viper/ptmp2/edrod/MKsegmentation/train_separate_classifiers.py` - Classifier training
-- `/viper/ptmp2/edrod/MKsegmentation/validate_classifier.py` - Classifier validation
-- `/viper/ptmp2/edrod/MKsegmentation/WORKFLOW.md` - Complete workflow documentation
-
-### Data
-- `/ptmp/edrod/unified_10pct/` - 10% segmentation output (INCOMPLETE - job failed)
-- `/ptmp/edrod/unified_100pct/` - 100% segmentation output (after training)
-- `/viper/ptmp2/edrod/MKsegmentation/annotations/` - Annotation files
-- `/viper/ptmp2/edrod/seg_tohtml_10pct/` - HTML for annotation
-
-### GitHub
-- Repo: `peptiderodriguez/mk_hspc_review`
-- Live site: `https://peptiderodriguez.github.io/mk_hspc_review/`
-
----
-
-## Key Learnings
-
-- **GPU memory is the bottleneck for worker count** - each worker loads SAM2, Cellpose, ResNet on GPU
-- **RAM can also be a bottleneck** - 16 workers × 7.5GB per worker = 120GB, exceeds 128GB limit
-- **Device bug is FIXED** - workers initialize successfully with `torch.device` object
-- **Filter consistency is CRITICAL** - segmentation, export, and convert scripts must use identical filters
-- **µm-based filtering preferred** - more intuitive across imaging systems, standard in biology literature
-- **Define validation thresholds before deployment** - don't deploy poor classifiers without objective criteria
-- **Classifier integration is complete** - `apply_classifier()` filters MK/HSPC detections during segmentation
-- **Pipeline behavior with/without classifiers:**
-  - Without: `--mk-classifier` omitted → accepts all cells passing size filter
-  - With: `--mk-classifier path/to/classifier.pkl` → filters cells using trained model
+1. **Current job completes** (~14-15 hours remaining)
+2. **User annotates** via GitHub Pages
+3. **Train classifiers** from annotations
+4. **Validate classifiers** (min 75% accuracy, 70% recall/precision)
+5. **Run 100% segmentation** with validated classifiers
+6. **(Optional)** Enable pipelined mode for faster processing:
+   - Add `--pipeline` flag to main script
+   - Will use 80% CPU for pre/post processing

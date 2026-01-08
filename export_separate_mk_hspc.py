@@ -15,6 +15,7 @@ import base64
 from io import BytesIO
 from PIL import Image
 import h5py
+import hdf5plugin  # Required for LZ4 compressed h5 files
 
 
 def load_samples(tiles_dir, reader, x_start, y_start, cell_type, pixel_size_um, max_samples=None):

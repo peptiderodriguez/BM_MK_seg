@@ -34,7 +34,7 @@ CALIBRATION_SAMPLES=100     # For auto-calibration
 # ============================================================================
 # Set to "single" for one slide, "batch" for all 16 slides
 # Batch mode loads models ONCE and processes all slides (much faster)
-MODE="single"
+MODE="batch"
 
 # Single slide to process (used when MODE="single")
 SLIDE="2025_11_18_FGC1"
@@ -100,7 +100,7 @@ if [ "$MODE" = "batch" ]; then
 
     echo "Found ${#CZI_PATHS[@]} valid CZI files"
 
-    python run_unified_FAST.py \
+    python -u run_unified_FAST.py \
         --czi-paths "${CZI_PATHS[@]}" \
         --output-dir "$OUTPUT_BASE" \
         --tile-size $TILE_SIZE \
@@ -129,7 +129,7 @@ else
     echo "Start time: $(date)"
     echo ""
 
-    python run_unified_FAST.py \
+    python -u run_unified_FAST.py \
         --czi-path "$CZI_PATH" \
         --output-dir "$OUTPUT_BASE/$SLIDE" \
         --tile-size $TILE_SIZE \
@@ -215,7 +215,7 @@ if [ ${#SLIDES[@]} -gt 0 ]; then
         fi
 
         cd "$SCRIPT_DIR"
-        python run_unified_FAST.py \
+        python -u run_unified_FAST.py \
             --czi-path "$CZI_PATH" \
             --output-dir "$OUTPUT_BASE/$SLIDE" \
             --tile-size $TILE_SIZE \
