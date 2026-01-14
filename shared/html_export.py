@@ -43,28 +43,47 @@ def percentile_normalize(image, p_low=5, p_high=95):
         return result
 
 
-def draw_mask_contour(img_array, mask, color=(0, 255, 0), thickness=2, dotted=False):
+def draw_mask_contour(img_array, mask, color=(0, 255, 0), thickness=2, dotted=False, use_cv2=True):
     """
     Draw mask contour on image.
 
     Args:
-        img_array: RGB image array
+        img_array: RGB image array (or grayscale, will be converted)
         mask: Binary mask
         color: RGB tuple for contour color
         thickness: Contour thickness in pixels
         dotted: Whether to use dotted line
+        use_cv2: Use OpenCV for faster, smoother contours (default True)
 
     Returns:
-        Image with contour drawn
+        Image with contour drawn (always RGB)
     """
+    import cv2
+
+    # Ensure RGB
+    if img_array.ndim == 2:
+        img_out = cv2.cvtColor(img_array, cv2.COLOR_GRAY2RGB)
+    else:
+        img_out = img_array.copy()
+
+    if use_cv2 and not dotted:
+        # Use cv2.drawContours for smooth, thick lines
+        contours, _ = cv2.findContours(
+            mask.astype(np.uint8),
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+        # Convert RGB to BGR for cv2, then back
+        cv2.drawContours(img_out, contours, -1, color, thickness)
+        return img_out
+
+    # Fallback to dilation method
     dilated = ndimage.binary_dilation(mask, iterations=thickness)
     contour = dilated & ~mask
     ys, xs = np.where(contour)
 
     if len(ys) == 0:
-        return img_array
-
-    img_out = img_array.copy()
+        return img_out
 
     if dotted:
         for i, (y, x) in enumerate(zip(ys, xs)):
