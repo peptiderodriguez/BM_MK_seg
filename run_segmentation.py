@@ -264,6 +264,12 @@ class UnifiedSegmenter:
         if crop.size == 0:
             return np.zeros(2048)
 
+        # Convert uint16 to uint8 if needed (CZI images are often 16-bit)
+        if crop.dtype == np.uint16:
+            crop = (crop / 256).astype(np.uint8)
+        elif crop.dtype != np.uint8:
+            crop = crop.astype(np.uint8)
+
         pil_img = Image.fromarray(crop)
         tensor = self.resnet_transform(pil_img).unsqueeze(0).to(self.device)
 
